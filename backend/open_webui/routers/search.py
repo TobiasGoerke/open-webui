@@ -89,6 +89,17 @@ def title_rank(title, query: str):
     return case((func.lower(title) == query.lower(), 0), (title.ilike(pattern(query), escape='\\'), 1), else_=3)
 
 
+def pg_strip_nul(value: str) -> str:
+    r"""Drop \u0000 escapes from a PostgreSQL json value; `->`, `->>` and `#>>` fail on them.
+
+    Escaped backslashes are parked on chr(1), which valid JSON never contains raw, so a literal
+    backslash followed by "u0000" in the message survives. Values without the escape take the plain path.
+    """
+    raw = f'({value})::text'
+    stripped = rf"replace(replace(replace({raw}, '\\', chr(1)), '\u0000', ''), chr(1), '\\')::json"
+    return rf"(CASE WHEN strpos({raw}, '\u0000') > 0 THEN {stripped} ELSE {value} END)"
+
+
 def message_match_sql(table: str, dialect: str, key: str):
     # Identifiers are internal constants; all user input remains bound parameters.
     if dialect == 'sqlite':
@@ -98,14 +109,15 @@ def message_match_sql(table: str, dialect: str, key: str):
         )
         row_content = "CASE WHEN json_type(m.content) = 'text' THEN json_extract(m.content, '$') END"
     else:
+        chat = pg_strip_nul(f'{table}.chat')
         sources = [
-            f"json_each(CASE WHEN json_typeof({table}.chat->'history'->'messages') = 'object' "
-            f"THEN {table}.chat->'history'->'messages' ELSE '{{}}'::json END)",
-            f"json_array_elements(CASE WHEN json_typeof({table}.chat->'messages') = 'array' "
-            f"THEN {table}.chat->'messages' ELSE '[]'::json END)",
+            f"json_each(CASE WHEN json_typeof({chat}->'history'->'messages') = 'object' "
+            f"THEN {chat}->'history'->'messages' ELSE '{{}}'::json END)",
+            f"json_array_elements(CASE WHEN json_typeof({chat}->'messages') = 'array' "
+            f"THEN {chat}->'messages' ELSE '[]'::json END)",
         ]
         legacy_content = "CASE WHEN json_typeof(m.value->'content') = 'string' THEN m.value->>'content' END"
-        row_content = "CASE WHEN json_typeof(m.content) = 'string' THEN m.content #>> '{}' END"
+        row_content = f"CASE WHEN json_typeof(m.content) = 'string' THEN {pg_strip_nul('m.content')} #>> '{{}}' END"
 
     legacy_match = ' OR '.join(
         f"EXISTS (SELECT 1 FROM {source} AS m WHERE lower({legacy_content}) LIKE :{key} ESCAPE '\\')"
